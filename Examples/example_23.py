@@ -5,6 +5,10 @@ from tensorflow.contrib.layers.python.layers import xavier_initializer
 import numpy
 import keras
 import cv2
+import skimage
+import skimage.io
+import matplotlib.pyplot as plt
+
 
 
 def lrelu(x, alpha=2e-1):
@@ -58,6 +62,44 @@ def sample_label():
     for i in range(0, num):
         label_vector[i, int(i/8)] = 1.0
     return label_vector
+
+
+def merge(images, size):
+    h, w = images.shape[1], images.shape[2]
+    img = numpy.zeros(h * size[0], w * size[1], 3)
+    for idx, image in enumerate(images):
+        i = idx % size[1]
+        j = idx // size[1]
+        img[j*h: j*h + h, i*w: i*w + w, :] = image
+    return img
+
+
+def save_image(images, size, path):
+    skimage.io.imsave(path, merge(images, size))
+
+
+def inverse_transform(image):
+    return (image + 1.0) / 2.0
+
+
+def save_images(images, size, image_path):
+    return save_image(inverse_transform(images), size, image_path)
+
+
+def vis_square(vis_path, data, type):
+    data = (data - data.min()) / (data.max() - data.min())
+    n = int(numpy.ceil(numpy.sqrt(data.shape[0])))
+    padding = (((0, n ** 2 - data.shape[0]),
+                (0, 1), (0, 1)) + ((0, 0),) * (data.ndim - 3))
+    data = numpy.pad(data, padding, mode='constant', constant_values=1)
+    data = data.reshape((n, n) + data.shape[1:]).transpose((0, 2, 1, 3) + tuple(range(4, data.ndim + 1)))
+    data = data.reshape((n * data.shape[1], n * data.shape[3]) + data.shape[4:])
+    plt.imshow(data[:, :, 0])
+    plt.axis('off')
+    if type:
+        plt.savefig('./{}/weights.png'.format(vis_path), format='png')
+    else:
+        plt.savefie('./{}/activation.png'.format(vis_path), format='png')
 
 
 class CGAN(object):
@@ -120,9 +162,25 @@ class CGAN(object):
             self.saver.restore(sess, self.model_path)
             sample_z = numpy.random.uniform(1, -1, size=[self.batch_size, self.z_dim])
             output = sess.run(self.fake_images, feed_dict={self.z: sample_z, self.y: sample_label()})
+            save_images(output, [8, 8], './{}/test{:02d}_{:04d}.png'.format(self.sample_dir, 0, 0))
+            image = cv2.imread('./{}/test{:02d}_{:04d}.png'.format(self.sample_dir, 0, 0), 0)
+            cv2.imshow('test', image)
+            cv2.waitKey(-1)
+            print('Test Finish!')
 
     def visual(self):
-        pass
+        init = tensorflow.initialize_all_variables()
+        with tensorflow.Session() as sess:
+            sess.run(init)
+            self.saver.restore(sess, self.model_path)
+            real_batch_array, real_labels = self.data_ob.getNext_batch(0)
+            batch_z = numpy.random.uniform(-1, 1, size=[self.batch_size, self.z_dim])
+            conv_weights = sess.run([tensorflow.get_collection('weight_2')])
+            vis_square(self.visua_path, conv_weights[0][0].transpose(3, 0, 1, 2), type=1)
+            ac = sess.run([tensorflow.get_collection('ac_2')],
+                          feed_dict={self.images: real_batch_array[:64], self.z: batch_z, self.y: sample_label()})
+            vis_square(self.visua_path, ac[0][0].transpose(3, 1, 2, 0), type=0)
+            print('The visualization finish!')
 
     def build_model(self):
         self.fake_images = self.gern_net(self.z, self.y)
@@ -145,4 +203,36 @@ class CGAN(object):
         self.d_var = [var for var in t_vars if 'dis' in var.name]
         self.g_var = [var for var in t_vars if 'gen' in var.name]
         self.saver = tensorflow.train.Saver()
+
+    def train(self, epochs=20):
+        opti_D = tensorflow.train.AdamOptimizer(learning_rate=self.learn_rate, beta1=5e-1).minimize(self.D_loss, var_list=self.d_var)
+        opti_G = tensorflow.train.AdamOptimizer(learning_rate=self.learn_rate, beta1=5e-1).minimize(self.G_loss, var_list=self.g_var)
+        init = tensorflow.global_variables_initializer()
+        config = tensorflow.ConfigProto()
+        config.gpu_options.allow_growth = True
+        with tensorflow.Session(config=config) as sess:
+            sess.run(init)
+            summary_writer = tensorflow.summary.FileWriter(self.log_dir, graph=sess.graph)
+            step = 0
+            while step < epochs:
+                real_batch_array, real_labels = self.data_ob.getNext_batch(step)
+                batch_z = numpy.random.uniform(-1, 1, size=[self.batch_size, self.z_dim])
+                _, summary_str = sess.run([opti_D, self.merged_summary_op_d],
+                                          feed_dict={self.images: real_batch_array, self.z: batch_z, self.y: real_labels})
+                summary_writer.add_summary(summary_str, step)
+                _, summary_str = sess.run([opti_G, self.merged_summary_op_g],
+                                          feed_dict={self.z: batch_z, self.y: real_labels})
+                if step % 2 == 0:
+                    D_loss = sess.run(self.D_loss, feed_dict={self.images: real_batch_array, self.z: batch_z, self.y: real_labels})
+                    fake_loss = sess.run(self.G_loss, feed_dict={self.z: batch_z, self.y: real_labels})
+                    print("Step %d: D: loss = %.7f G: loss=%.7f" % (step, D_loss, fake_loss))
+
+                if numpy.mod(step, 50) == 1 and step != 0:
+                    sample_images = sess.run(self.fake_images, feed_dict={self.z: batch_z, self.y: sample_label()})
+                    save_images(sample_images, [8, 8], './{}/train_{:04d}.png'.format(self.sample_dir, step))
+                    self.saver.save(sess, self.model_path)
+                step = step + 1
+            save_path = self.saver.save(sess, self.model_path)
+            print('Model saved in file: %s' % save_path)
+
 
